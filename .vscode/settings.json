@@ -1,0 +1,6 @@
+{
+  "python.defaultInterpreterPath": "D:\\poetry-venvs\\ocr-AqN7qd7O-py3.12\\Scripts\\python.exe",
+  "python.analysis.extraPaths": [
+    "D:\\poetry-venvs\\ocr-AqN7qd7O-py3.12\\Lib\\site-packages"
+  ]
+}
