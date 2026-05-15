@@ -2,15 +2,18 @@
 
 import re
 import time
-import threading
+from concurrent.futures import ThreadPoolExecutor
 import cv2
 import numpy as np
-from pathlib import Path
-
-PRINT_DIR = Path(__file__).parent / "print"
-PRINT_DIR.mkdir(exist_ok=True)
 
 ROI               = (454, 168, 960, 838)  # x, y, w, h
+CHECK_ABOVE_H     = 150                    # 藍框高度 (px)
+CHECK_BLUE_THRESH = 50                     # 藍框：暗色像素閾值 (0~255)
+CHECK_BLUE_RATIO  = 0.50                   # 藍框：暗色比例門檻
+CHECK_RED_H       = 100                    # 紅框寬度 (px)
+CHECK_RED_V       = 150                    # 紅框高度 (px)
+CHECK_RED_THRESH  = 20                     # 紅框：暗色像素閾值 (0~255)
+CHECK_RED_RATIO   = 0.20                   # 紅框：暗色比例門檻
 BINARIZE_THRESH   = 140
 CLOSE_KERNEL_SIZE = 3
 CLOSE_ITERATIONS  = 1
@@ -101,37 +104,6 @@ def merge_same_row_rects(
     pairs = sorted(zip(result_rects, result_texts), key=lambda p: (p[0][1], p[0][0]))
     return [p[0] for p in pairs], [p[1] for p in pairs]
 
-
-def save_block_sheet(
-    cropped: np.ndarray,
-    rects: list[tuple[int,int,int,int]],
-    labels: list[str],
-    path: Path,
-) -> None:
-    ih, iw = cropped.shape[:2]
-    blocks  = []
-    for (x, y, bw, bh), label in zip(rects, labels):
-        x1, x2 = max(0, x-BLOCK_BORDER), min(iw, x+bw+BLOCK_BORDER)
-        y1, y2 = max(0, y-BLOCK_BORDER), min(ih, y+bh+BLOCK_BORDER)
-        block  = cropped[y1:y2, x1:x2].copy()
-        if block.size == 0:
-            continue
-        bar = np.full((28, block.shape[1], 3), (30, 30, 30), dtype=np.uint8)
-        cv2.putText(bar, label, (4, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 230, 100), 1, cv2.LINE_AA)
-        blocks.append(np.vstack([block, bar]))
-    if not blocks:
-        return
-    max_w = max(b.shape[1] for b in blocks)
-    sep   = np.full((3, max_w, 3), (120, 120, 120), dtype=np.uint8)
-    rows  = []
-    for b in blocks:
-        if b.shape[1] < max_w:
-            b = np.hstack([b, np.full((b.shape[0], max_w-b.shape[1], 3), (50, 50, 50), dtype=np.uint8)])
-        rows.append(b)
-    sheet = rows[0]
-    for b in rows[1:]:
-        sheet = np.vstack([sheet, sep, b])
-    cv2.imwrite(str(path), sheet, [cv2.IMWRITE_JPEG_QUALITY, 95])
 
 
 # ── 投票與格式驗證 ─────────────────────────────────────────────────────
@@ -237,15 +209,15 @@ class EasyOCREngine:
             self._model = easyocr.Reader(["en"], gpu=False)
             print("Thread 執行同步完成 (EasyOCR)")
 
-    def __call__(self, processed: np.ndarray) -> tuple[list[tuple[int,int,int,int]], list[str]]:
+    def __call__(self, processed: np.ndarray) -> tuple[list, list]:
         self.load()
         inp = cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR) if len(processed.shape) == 2 else processed
         rects, texts = [], []
-        for item in (self._model.readtext(inp) or []):
-            pts = np.array(item[0], dtype=np.int32)
+        for (bbox, text, _prob) in (self._model.readtext(inp) or []):
+            pts = np.array(bbox, dtype=np.int32)
             x, y, w, h = cv2.boundingRect(pts)
             rects.append((x, y, w, h))
-            texts.append(item[1])
+            texts.append(text)
         pairs = sorted(zip(rects, texts), key=lambda p: (p[0][1], p[0][0]))
         return merge_same_row_rects([p[0] for p in pairs], [p[1] for p in pairs])
 
@@ -260,11 +232,14 @@ class TrOCREngine:
             print("Thread 執行同步中 (TrOCR)...")
             # transformers 4.45+ 與 torchvision 0.20+ 有相容性問題，繞過 TrOCRProcessor
             from transformers import DeiTImageProcessor, AutoTokenizer, VisionEncoderDecoderModel
-            self._processor = (
-                DeiTImageProcessor.from_pretrained("microsoft/trocr-small-printed"),
-                AutoTokenizer.from_pretrained("microsoft/trocr-small-printed", use_fast=False),
-            )
-            self._model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-small-printed")
+            # processor 與 tokenizer 可並行載入
+            with ThreadPoolExecutor(max_workers=2) as loader:
+                fut_ip = loader.submit(DeiTImageProcessor.from_pretrained, "microsoft/trocr-small-printed", local_files_only=True)
+                fut_tk = loader.submit(AutoTokenizer.from_pretrained,      "microsoft/trocr-small-printed", use_fast=False, local_files_only=True)
+                image_processor = fut_ip.result()
+                tokenizer       = fut_tk.result()
+            self._processor = (image_processor, tokenizer)
+            self._model = VisionEncoderDecoderModel.from_pretrained("microsoft/trocr-small-printed", local_files_only=True)
             self._model.eval()
             print("Thread 執行同步完成 (TrOCR)")
 
@@ -344,90 +319,83 @@ class OCRPipeline:
         self.easy   = EasyOCREngine()
         self.trocr  = TrOCREngine()
         self.paddle = PaddleOCREngine()
+        self._pool  = ThreadPoolExecutor(max_workers=3)
 
     def preload(self):
-        # 依序載入：PaddleOCR 的 os.dup2 不可與其他引擎並行
-        self.easy.load()
-        self.trocr.load()
+        # EasyOCR 與 TrOCR 可並行載入；PaddleOCR 需單獨載入（os.dup2 stderr 重導向不可並行）
+        fut_e = self._pool.submit(self.easy.load)
+        fut_t = self._pool.submit(self.trocr.load)
+        fut_e.result()
+        fut_t.result()
         self.paddle.load()
 
-    def scan(self, frame: np.ndarray, roi: tuple[int,int,int,int], out_dir: Path) -> list[str]:
+    def scan(self, frame: np.ndarray, roi: tuple[int,int,int,int]) -> list[str]:
+        t_total = time.time()
         rx, ry, rw, rh = roi
         cropped = crop_by_roi(frame, rx, ry, rw, rh)
-        cv2.imwrite(str(out_dir / "roi.jpg"), cropped, [cv2.IMWRITE_JPEG_QUALITY, 95])
-
         binary = to_gray(cropped)
-        cv2.imwrite(str(out_dir / "binary.jpg"), binary, [cv2.IMWRITE_JPEG_QUALITY, 95])
-
         processed = close_gaps(binary)
-        cv2.imwrite(str(out_dir / "processed.jpg"), processed, [cv2.IMWRITE_JPEG_QUALITY, 95])
         processed_bgr = cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR)
-
-        t = time.time()
-        rects, texts = self.easy(processed)
-        easy_sec     = time.time() - t
-        easy_labels  = [s.upper() for s in texts]
-        for label in easy_labels: print(f"easyOCR : {label}")
-        save_block_sheet(processed_bgr, rects, easy_labels, out_dir / "easyOCR.jpg")
-        print(f"easyOCR 耗時   : {easy_sec:.2f} 秒")
-
         paddle_input = apply_clahe_color(cropped)
-        cv2.imwrite(str(out_dir / "paddle_enhanced.jpg"), paddle_input, [cv2.IMWRITE_JPEG_QUALITY, 95])
 
-        trocr_out:  list = [None, 0.0, None]  # [list[str]|None, float, Exception|None]
-        paddle_out: list = [None, 0.0, None]
+        # Step 1: EasyOCR
+        rects, texts = self.easy(processed)
+        easy_labels = [s.upper() for s in texts]
+        for label in easy_labels: print(f"easyOCR   : {label}")
 
-        def _run_trocr():
-            try:
-                t = time.time()
-                trocr_out[0] = self.trocr(processed_bgr, rects)
-                trocr_out[1] = time.time() - t
-            except Exception as exc:
-                trocr_out[2] = exc
-
-        def _run_paddle():
-            try:
-                t = time.time()
-                paddle_out[0] = self.paddle(paddle_input, rects)
-                paddle_out[1] = time.time() - t
-            except Exception as exc:
-                paddle_out[2] = exc
-
-        th_t = threading.Thread(target=_run_trocr,  daemon=True)
-        th_p = threading.Thread(target=_run_paddle, daemon=True)
-        th_t.start(); th_p.start()
-        th_t.join();  th_p.join()
-
-        if trocr_out[2]:  raise trocr_out[2]
-        if paddle_out[2]: raise paddle_out[2]
-
-        trocr_texts,  trocr_sec  = trocr_out[0],  trocr_out[1]
-        paddle_texts, paddle_sec = paddle_out[0], paddle_out[1]
-
+        # Step 2+3: TrOCR + PaddleOCR 並行
+        fut_t = self._pool.submit(self.trocr,  processed_bgr, rects)
+        fut_p = self._pool.submit(self.paddle, paddle_input,  rects)
+        trocr_texts  = fut_t.result()
+        paddle_texts = fut_p.result()
         trocr_labels  = [re.sub(r'[^A-Z0-9]', '', s.upper()) for s in trocr_texts]
         paddle_labels = [re.sub(r'[^A-Z0-9]', '', s.upper()) for s in paddle_texts]
-
-        for label in trocr_labels:  print(f"TrOCR : {label}")
-        save_block_sheet(processed_bgr, rects, trocr_labels, out_dir / "TrOCR.jpg")
-        print(f"TrOCR 耗時     : {trocr_sec:.2f} 秒")
-
+        for label in trocr_labels:  print(f"TrOCR     : {label}")
         for label in paddle_labels: print(f"PaddleOCR : {label}")
-        save_block_sheet(paddle_input, rects, paddle_labels, out_dir / "paddleOCR.jpg")
-        print(f"PaddleOCR 耗時 : {paddle_sec:.2f} 秒")
 
         voted_labels, norm_per_row = [], []
         for i, (raw_e, raw_t, raw_p) in enumerate(zip(texts, trocr_texts, paddle_texts)):
-            fmt               = ROW_FORMATS[i] if i < len(ROW_FORMATS) else 'alphanumeric'
+            fmt = ROW_FORMATS[i] if i < len(ROW_FORMATS) else 'alphanumeric'
             norm_e, norm_t, norm_p = [normalize_result(r, fmt) for r in (raw_e, raw_t, raw_p)]
-            voted             = vote_chars([norm_e, norm_t, norm_p])
+            voted = vote_chars([norm_e, norm_t, norm_p])
             voted_labels.append(voted)
             norm_per_row.append((norm_e, norm_t, norm_p))
             print(f"投票結果  : {voted}  ({norm_e} | {norm_t} | {norm_p})")
 
         voted_labels = apply_domain_rules(voted_labels, norm_per_row)
         for label in voted_labels: print(f"驗證結果  : {label}")
-        print(f"總耗時         : {easy_sec + max(trocr_sec, paddle_sec):.2f} 秒")
+        print(f"總耗時           : {time.time() - t_total:.2f} 秒")
         return voted_labels
+
+
+# ── 瓶口方向檢查 ───────────────────────────────────────────────────────
+
+def get_dark_ratio(frame: np.ndarray, rx: int, ry: int, rw: int) -> float:
+    y1 = max(0, ry - CHECK_ABOVE_H - 10)
+    y2 = max(0, ry - 10)
+    region = frame[y1:y2, rx:rx + rw]
+    if region.size == 0:
+        return 0.0
+    gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+    return float(np.sum(gray < CHECK_BLUE_THRESH) / gray.size)
+
+
+def check_bottle_orientation(frame: np.ndarray, rx: int, ry: int, rw: int) -> bool:
+    dark_ratio = get_dark_ratio(frame, rx, ry, rw)
+    print(f"藍框暗色比例: {dark_ratio:.2%}（門檻 {CHECK_BLUE_RATIO:.0%}）")
+    return dark_ratio >= CHECK_BLUE_RATIO
+
+
+def get_red_ratio(frame: np.ndarray, rx: int, ry: int, rw: int) -> float:
+    x1 = rx + rw + 5
+    x2 = min(frame.shape[1], x1 + CHECK_RED_H)
+    y1 = max(0, ry - CHECK_RED_V - 10)
+    y2 = max(0, ry - 10)
+    region = frame[y1:y2, x1:x2]
+    if region.size == 0:
+        return 0.0
+    gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+    return float(np.sum(gray > CHECK_RED_THRESH) / gray.size)
 
 
 # ── 主程式 ─────────────────────────────────────────────────────────────
@@ -448,11 +416,7 @@ def main():
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"攝影機 {cam_idx} 已開啟，原生解析度: {w}x{h}，顯示解析度: 1920x1080")
-    print("\
-操作說明:\
-  ENTER -> 辨識  P -> 框選ROI  ESC -> 離開")
-    print(f"print 目錄: {PRINT_DIR}\
-")
+    print("操作說明:  ENTER -> 辨識  P -> 框選ROI  ESC -> 離開")
 
     DISPLAY_W, DISPLAY_H = 1920, 1080
     window_name = "OCR"
@@ -460,9 +424,9 @@ def main():
     cv2.resizeWindow(window_name, 1280, 720)
     cv2.setMouseCallback(window_name, _mouse_cb)
 
-    pipeline      = OCRPipeline()
-    preload_thread = threading.Thread(target=pipeline.preload, daemon=True, name="preload")
-    preload_thread.start()
+    pipeline         = OCRPipeline()
+    preload_thread   = None
+    prev_has_bottle  = False
 
     while True:
         cap.grab()
@@ -484,9 +448,39 @@ def main():
             cv2.imshow(window_name, display)
         else:
             cv2.rectangle(frame, (rx, ry), (rx+rw, ry+rh), (0, 255, 0), 2)
-            cv2.putText(frame, f"Cam {cam_idx} | ENTER: Scan  P: Select ROI  ESC: Quit",
+            blue_y1 = max(0, ry - CHECK_ABOVE_H - 10)
+            blue_y2 = ry - 10
+            red_y1  = max(0, ry - CHECK_RED_V - 10)
+            red_y2  = ry - 10
+            cv2.rectangle(frame, (rx, blue_y1), (rx + rw, blue_y2), (255, 0, 0), 2)
+            cv2.rectangle(frame, (rx + rw + 5, red_y1), (rx + rw + 5 + CHECK_RED_H, red_y2), (0, 0, 255), 2)
+            cv2.putText(frame, f"Cam {cam_idx} | 自動偵測中  ENTER: 手動掃描  P: ROI  ESC: Quit",
                         (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
             cv2.imshow(window_name, frame)
+
+        # ── 自動偵測：紅框邊緣觸發 ──────────────────────────────────────
+        if not _sel["active"]:
+            has_bottle = get_red_ratio(frame, rx, ry, rw) < CHECK_RED_RATIO
+            if has_bottle != prev_has_bottle:
+                print("有瓶子" if has_bottle else "沒瓶子")
+            if has_bottle and not prev_has_bottle:
+                if not check_bottle_orientation(frame, rx, ry, rw):
+                    print("錯誤：培養瓶裝反了")
+                else:
+                    if preload_thread is None:
+                        import threading
+                        preload_thread = threading.Thread(target=pipeline.preload, daemon=True, name="preload")
+                        preload_thread.start()
+                    if preload_thread.is_alive():
+                        print("OCR 引擎載入中，請稍候...")
+                        preload_thread.join()
+                    print("辨識中...")
+                    try:
+                        pipeline.scan(frame, (rx, ry, rw, rh))
+                    except Exception:
+                        import traceback
+                        traceback.print_exc()
+            prev_has_bottle = has_bottle
 
         key = cv2.waitKey(1) & 0xFF
 
@@ -511,14 +505,22 @@ def main():
             print("框選已取消")
 
         elif key == 13:
-            if preload_thread.is_alive():
-                print("OCR 引擎載入中，請稍候...")
-                preload_thread.join()
-            print("辨識中...")
-            try:
-                pipeline.scan(frame, (rx, ry, rw, rh), PRINT_DIR)
-            except Exception as e:
-                print(f"辨識錯誤: {e}")
+            if not check_bottle_orientation(frame, rx, ry, rw):
+                print("錯誤：培養瓶裝反了")
+            else:
+                if preload_thread is None:
+                    import threading
+                    preload_thread = threading.Thread(target=pipeline.preload, daemon=True, name="preload")
+                    preload_thread.start()
+                if preload_thread.is_alive():
+                    print("OCR 引擎載入中，請稍候...")
+                    preload_thread.join()
+                print("辨識中...")
+                try:
+                    pipeline.scan(frame, (rx, ry, rw, rh))
+                except Exception:
+                    import traceback
+                    traceback.print_exc()
 
     cap.release()
     cv2.destroyAllWindows()
