@@ -1,5 +1,11 @@
 ﻿"""OCR 影像擷取腳本 — ENTER: 辨識  P: 框選ROI  ESC: 離開"""
 
+import sys, io, ctypes
+ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+ctypes.windll.kernel32.SetConsoleCP(65001)
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -10,10 +16,13 @@ ROI               = (454, 168, 960, 838)  # x, y, w, h
 CHECK_ABOVE_H     = 150                    # 藍框高度 (px)
 CHECK_BLUE_THRESH = 50                     # 藍框：暗色像素閾值 (0~255)
 CHECK_BLUE_RATIO  = 0.50                   # 藍框：暗色比例門檻
-CHECK_RED_H       = 100                    # 紅框寬度 (px)
-CHECK_RED_V       = 150                    # 紅框高度 (px)
+CHECK_RED_H       = 250                    # 紅框寬度 (px)
+CHECK_RED_V       = 180                    # 紅框高度 (px)
+CHECK_RED_Y_OFFSET = 100                   # 紅框底部距 ROI 上緣的偏移（正值=往下）
 CHECK_RED_THRESH  = 20                     # 紅框：暗色像素閾值 (0~255)
 CHECK_RED_RATIO   = 0.20                   # 紅框：暗色比例門檻
+CHECK_RED_INTERVAL = 2.0                  # 紅框偵測間隔（秒）
+CHECK_RED_DEBOUNCE = 1.0                  # 偵測到變化後，等待此時間再辨識（秒）
 BINARIZE_THRESH   = 140
 CLOSE_KERNEL_SIZE = 3
 CLOSE_ITERATIONS  = 1
@@ -382,20 +391,20 @@ def get_dark_ratio(frame: np.ndarray, rx: int, ry: int, rw: int) -> float:
 
 def check_bottle_orientation(frame: np.ndarray, rx: int, ry: int, rw: int) -> bool:
     dark_ratio = get_dark_ratio(frame, rx, ry, rw)
-    print(f"藍框暗色比例: {dark_ratio:.2%}（門檻 {CHECK_BLUE_RATIO:.0%}）")
     return dark_ratio >= CHECK_BLUE_RATIO
 
 
-def get_red_ratio(frame: np.ndarray, rx: int, ry: int, rw: int) -> float:
+def get_red_dark_ratio(frame: np.ndarray, rx: int, ry: int, rw: int) -> float:
+    """紅框內暗色像素比例：比例高 = 無瓶子（背景黑），比例低 = 有瓶子（瓶面較亮）"""
     x1 = rx + rw + 5
     x2 = min(frame.shape[1], x1 + CHECK_RED_H)
-    y1 = max(0, ry - CHECK_RED_V - 10)
-    y2 = max(0, ry - 10)
+    y1 = max(0, ry - CHECK_RED_V + CHECK_RED_Y_OFFSET)
+    y2 = min(frame.shape[0], ry + CHECK_RED_Y_OFFSET)
     region = frame[y1:y2, x1:x2]
     if region.size == 0:
-        return 0.0
+        return 1.0  # 讀不到視為無瓶子
     gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
-    return float(np.sum(gray > CHECK_RED_THRESH) / gray.size)
+    return float(np.sum(gray < CHECK_RED_THRESH) / gray.size)
 
 
 # ── 主程式 ─────────────────────────────────────────────────────────────
@@ -424,9 +433,19 @@ def main():
     cv2.resizeWindow(window_name, 1280, 720)
     cv2.setMouseCallback(window_name, _mouse_cb)
 
-    pipeline         = OCRPipeline()
-    preload_thread   = None
-    prev_has_bottle  = False
+    show_overlay          = False  # M 鍵切換：顯示/隱藏綠框、藍框、紅框
+    pipeline              = OCRPipeline()
+    import threading
+    preload_thread        = threading.Thread(target=pipeline.preload, daemon=True, name="preload")
+    preload_thread.start()
+    print("OCR 引擎載入中，請稍候...")
+    preload_thread.join()
+    print("OCR 引擎載入完成，開始辨識")
+    prev_has_bottle       = False  # True 在掃描或方向錯誤後設定，瓶子離開才重置
+    last_displayed_bottle = False  # 僅用於「有瓶子/沒瓶子」印出去重
+    last_red_check        = 0.0   # 上次紅框偵測時間
+    bottle_trigger_at     = 0.0   # 首次偵測到有瓶子的時間（debounce 起點）
+    status_lines          = ["Standby"]  # 左上角顯示文字
 
     while True:
         cap.grab()
@@ -447,40 +466,54 @@ def main():
                         (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
             cv2.imshow(window_name, display)
         else:
-            cv2.rectangle(frame, (rx, ry), (rx+rw, ry+rh), (0, 255, 0), 2)
-            blue_y1 = max(0, ry - CHECK_ABOVE_H - 10)
-            blue_y2 = ry - 10
-            red_y1  = max(0, ry - CHECK_RED_V - 10)
-            red_y2  = ry - 10
-            cv2.rectangle(frame, (rx, blue_y1), (rx + rw, blue_y2), (255, 0, 0), 2)
-            cv2.rectangle(frame, (rx + rw + 5, red_y1), (rx + rw + 5 + CHECK_RED_H, red_y2), (0, 0, 255), 2)
-            cv2.putText(frame, f"Cam {cam_idx} | 自動偵測中  ENTER: 手動掃描  P: ROI  ESC: Quit",
-                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
-            cv2.imshow(window_name, frame)
+            display = frame.copy()
+            if show_overlay:
+                cv2.rectangle(display, (rx, ry), (rx+rw, ry+rh), (0, 255, 0), 2)
+                blue_y1 = max(0, ry - CHECK_ABOVE_H - 10)
+                blue_y2 = ry - 10
+                red_y1  = max(0, ry - CHECK_RED_V + CHECK_RED_Y_OFFSET)
+                red_y2  = ry + CHECK_RED_Y_OFFSET
+                cv2.rectangle(display, (rx, blue_y1), (rx + rw, blue_y2), (255, 0, 0), 2)
+                cv2.rectangle(display, (rx + rw + 5, red_y1), (rx + rw + 5 + CHECK_RED_H, red_y2), (0, 0, 255), 2)
+            for i, line in enumerate(status_lines):
+                cv2.putText(display, line, (10, 30 + i * 35),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
+            cv2.imshow(window_name, display)
 
-        # ── 自動偵測：紅框邊緣觸發 ──────────────────────────────────────
-        if not _sel["active"]:
-            has_bottle = get_red_ratio(frame, rx, ry, rw) < CHECK_RED_RATIO
-            if has_bottle != prev_has_bottle:
-                print("有瓶子" if has_bottle else "沒瓶子")
-            if has_bottle and not prev_has_bottle:
+        # ── 自動偵測：紅框邊緣觸發（用未畫框的原始 frame 偵測）──────────
+        if not _sel["active"] and time.time() - last_red_check >= CHECK_RED_INTERVAL:
+            last_red_check = time.time()
+            dark_ratio = get_red_dark_ratio(frame, rx, ry, rw)
+            has_bottle = dark_ratio < CHECK_RED_RATIO  # 暗色少 → 有瓶子
+
+            if has_bottle != last_displayed_bottle:
+                print("紅框:有瓶子" if has_bottle else "紅框:無瓶子", flush=True)
+                status_lines = ["Red: Bottle detected" if has_bottle else "Red: No bottle"]
+                last_displayed_bottle = has_bottle
+                if has_bottle:
+                    bottle_trigger_at = time.time()  # 記錄變化時間點，開始 debounce
+
+            if has_bottle and not prev_has_bottle and time.time() - bottle_trigger_at >= CHECK_RED_DEBOUNCE:
                 if not check_bottle_orientation(frame, rx, ry, rw):
-                    print("錯誤：培養瓶裝反了")
+                    print("藍框:培養瓶裝反了", flush=True)
+                    status_lines = ["Blue: Wrong orientation"]
+                    prev_has_bottle = True
                 else:
-                    if preload_thread is None:
-                        import threading
-                        preload_thread = threading.Thread(target=pipeline.preload, daemon=True, name="preload")
-                        preload_thread.start()
                     if preload_thread.is_alive():
                         print("OCR 引擎載入中，請稍候...")
                         preload_thread.join()
                     print("辨識中...")
                     try:
-                        pipeline.scan(frame, (rx, ry, rw, rh))
+                        results = pipeline.scan(frame, (rx, ry, rw, rh))
+                        if results:
+                            status_lines = results
                     except Exception:
                         import traceback
                         traceback.print_exc()
-            prev_has_bottle = has_bottle
+                    prev_has_bottle = True
+
+            if not has_bottle:
+                prev_has_bottle = False  # 瓶子離開，重置讓下次進入可觸發
 
         key = cv2.waitKey(1) & 0xFF
 
@@ -504,20 +537,23 @@ def main():
             _sel.update(active=False, start=None, end=None, frame=None)
             print("框選已取消")
 
+        elif key in (ord('m'), ord('M')):
+            show_overlay = not show_overlay
+            print("框線顯示：開" if show_overlay else "框線顯示：關")
+
         elif key == 13:
             if not check_bottle_orientation(frame, rx, ry, rw):
-                print("錯誤：培養瓶裝反了")
+                print("藍框:培養瓶裝反了")
+                status_lines = ["Blue: Wrong orientation"]
             else:
-                if preload_thread is None:
-                    import threading
-                    preload_thread = threading.Thread(target=pipeline.preload, daemon=True, name="preload")
-                    preload_thread.start()
                 if preload_thread.is_alive():
                     print("OCR 引擎載入中，請稍候...")
                     preload_thread.join()
                 print("辨識中...")
                 try:
-                    pipeline.scan(frame, (rx, ry, rw, rh))
+                    results = pipeline.scan(frame, (rx, ry, rw, rh))
+                    if results:
+                        status_lines = results
                 except Exception:
                     import traceback
                     traceback.print_exc()
