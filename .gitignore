@@ -2,3 +2,9 @@
 __pycache__/
 *.pyc
 print/
+dist/
+build/
+*.log
+run_err.txt
+run_out.txt
+.claude/

@@ -1,19 +1,30 @@
 [tool.poetry]
-name = "ocr"
-version = "0.1.0"
-description = "OCR camera capture tool"
-authors = ["willes.chen <2willes.0103@gmail.com>"]
-package-mode = false
+name = "ocr-fastapi-server"
+version = "1.0.0"
+description = "OCR API Server with EasyOCR, TrOCR, and PaddleOCR"
+authors = ["Your Name <you@example.com>"]
 
 [tool.poetry.dependencies]
-python = "^3.12"
-easyocr = ">=1.7"
-opencv-python = ">=4.8.0,<5.0"
-numpy = ">=1.23,<2.0"
-pillow = ">=10.0"
-paddleocr = ">=2.7"
-paddlepaddle = ">=2.6"
-transformers = ">=4.30"
+python = ">=3.11,<3.12"
+fastapi = "*"
+uvicorn = "*"
+opencv-python = "*"
+numpy = "*"
+Pillow = "*"
+torch = {version = ">=2.0,<3.0", source = "pytorch-cpu"}
+torchvision = {version = ">=0.15,<1.0", source = "pytorch-cpu"}
+easyocr = "*"
+transformers = ">=4.30,<5.0"
+paddleocr = "*"
+paddlepaddle = "*"
+
+[tool.poetry.group.build.dependencies]
+pyinstaller = ">=6.0"
+
+[[tool.poetry.source]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+priority = "explicit"
 
 [build-system]
 requires = ["poetry-core"]
